@@ -45,6 +45,8 @@ python api_server.py
 | `POST` | `/separate` | 分离音频，返回 JSON 元数据 |
 | `POST` | `/separate/download` | 分离并下载 ZIP |
 
+完整接口文档见 [`docs/API.md`](docs/API.md)。
+
 ## 调用示例
 
 ```python

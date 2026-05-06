@@ -60,9 +60,10 @@ def _apply_resource_limits():
             proc.nice(psutil.HIGH_PRIORITY_CLASS)
         cpu_count = psutil.cpu_count(logical=True)
         if cpu_count and cpu_count > 1:
-            half = cpu_count // 2
-            proc.cpu_affinity(list(range(half)))
-            logger.info(f"CPU affinity set to {half}/{cpu_count} cores")
+            n = int(os.getenv("AS_CPU_CORES", str(cpu_count // 2)))
+            n = max(1, min(n, cpu_count))
+            proc.cpu_affinity(list(range(n)))
+            logger.info(f"CPU affinity set to {n}/{cpu_count} cores")
     except ImportError:
         pass
     except Exception:
