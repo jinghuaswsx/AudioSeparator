@@ -1,0 +1,8 @@
+audio-separator[gpu]>=0.44.1
+fastapi>=0.100
+uvicorn[standard]>=0.20
+torch>=2.3
+psutil
+httpx  # for tests
+soundfile  # for tests
+numpy  # for tests
