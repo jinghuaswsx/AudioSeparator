@@ -16,8 +16,9 @@ import os
 import platform
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import uvicorn
 import torch
@@ -35,6 +36,7 @@ CACHE_DIR = os.getenv("AS_CACHE_DIR", os.path.join(os.path.dirname(__file__), "c
 DEFAULT_ENSEMBLE_PRESET = os.getenv("AS_DEFAULT_PRESET", "vocal_balanced")
 CACHE_TTL_SEC = int(os.getenv("AS_CACHE_TTL", "3600"))
 GPU_MEMORY_FRACTION = float(os.getenv("AS_GPU_FRACTION", "0.9"))
+ASYNC_TASK_TTL_SEC = int(os.getenv("AS_ASYNC_TTL", "3600"))
 
 for d in (MODEL_DIR, OUTPUT_DIR, LOG_DIR, CACHE_DIR):
     os.makedirs(d, exist_ok=True)
@@ -92,6 +94,8 @@ _queue_count: int = 0
 async def _track_queue_middleware(request, call_next):
     global _queue_count
     if request.url.path in ("/separate", "/separate/download"):
+        # Async paths self-account inside _run_async_task; only count
+        # synchronous separate calls here so /health stays accurate.
         _queue_count += 1
         try:
             return await call_next(request)
@@ -133,6 +137,73 @@ async def _cache_cleanup():
                 del _cache[k]
         if expired:
             logger.info(f"Cache cleanup: removed {len(expired)} entries ({len(_cache)} remain)")
+
+
+# ── Async Tasks ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class AsyncTask:
+    task_id: str
+    mode: str  # "json" or "zip"
+    input_filename: str
+    input_size_mb: float
+    state: str = "queued"  # queued / running / done / failed
+    created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    result_json: Optional[dict] = None
+    result_zip: Optional[bytes] = None
+    error: Optional[str] = None
+
+
+_async_tasks: dict[str, AsyncTask] = {}
+
+
+async def _async_cleanup():
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        expired = [tid for tid, t in _async_tasks.items()
+                   if t.finished_at and (now - t.finished_at) > ASYNC_TASK_TTL_SEC]
+        for tid in expired:
+            _async_tasks.pop(tid, None)
+        if expired:
+            logger.info(f"Async task cleanup: removed {len(expired)} ({len(_async_tasks)} remain)")
+
+
+async def _run_async_task(task_id: str, content: bytes, filename: str, size_mb: float,
+                          ensemble_preset: Optional[str], model_filename: Optional[str],
+                          output_format: str, single_stem: Optional[str], want_zip: bool):
+    global _queue_count
+    t = _async_tasks.get(task_id)
+    if t is None:
+        return
+    _queue_count += 1
+    try:
+        t.state = "running"
+        t.started_at = time.time()
+        result, from_cache = await _process_or_cache(
+            content, filename, size_mb,
+            ensemble_preset, model_filename, output_format, single_stem,
+            return_zip=want_zip,
+        )
+        if want_zip:
+            t.result_zip = result
+        else:
+            if from_cache and isinstance(result, bytes):
+                result = json.loads(result.decode("utf-8"))
+            result = dict(result)
+            result["cached"] = from_cache
+            t.result_json = result
+        t.state = "done"
+    except Exception as e:
+        t.error = str(e)
+        t.state = "failed"
+        logger.exception(f"async task {task_id} failed")
+    finally:
+        t.finished_at = time.time()
+        _queue_count = max(0, _queue_count - 1)
 
 
 # ── Model Cache ────────────────────────────────────────────────────────────
@@ -304,6 +375,7 @@ async def _process_or_cache(content: bytes, filename: str, input_size_mb: float,
 async def startup():
     _apply_resource_limits()
     asyncio.create_task(_cache_cleanup())
+    asyncio.create_task(_async_cleanup())
 
     logger.info(f"Pre-warming: {DEFAULT_ENSEMBLE_PRESET}")
     try:
@@ -413,6 +485,120 @@ async def separate_and_download(
         headers={
             "Content-Disposition": f'attachment; filename="{base_name}_separated.zip"',
             "X-Cached": str(from_cache).lower(),
+        },
+    )
+
+
+# ── Async Routes ───────────────────────────────────────────────────────────
+
+
+@app.post("/separate_async")
+async def separate_async(
+    file: UploadFile = File(...),
+    ensemble_preset: Optional[str] = Form(default=None),
+    model_filename: Optional[str] = Form(default=None),
+    output_format: str = Form(default="WAV"),
+    single_stem: Optional[str] = Form(default=None),
+):
+    output_format = output_format.upper()
+    if output_format not in ("WAV", "FLAC", "MP3", "OGG", "M4A"):
+        raise HTTPException(400, f"Unsupported format: {output_format}")
+
+    content = await file.read()
+    size_mb = len(content) / (1024 * 1024)
+    task_id = uuid.uuid4().hex
+    _async_tasks[task_id] = AsyncTask(
+        task_id=task_id, mode="json",
+        input_filename=file.filename or "", input_size_mb=size_mb,
+    )
+    asyncio.create_task(_run_async_task(
+        task_id, content, file.filename or "", size_mb,
+        ensemble_preset, model_filename, output_format, single_stem, want_zip=False,
+    ))
+    return {
+        "task_id": task_id,
+        "state": "queued",
+        "status_url": f"/tasks/{task_id}",
+    }
+
+
+@app.post("/separate/download_async")
+async def separate_download_async(
+    file: UploadFile = File(...),
+    ensemble_preset: Optional[str] = Form(default=None),
+    model_filename: Optional[str] = Form(default=None),
+    output_format: str = Form(default="WAV"),
+    single_stem: Optional[str] = Form(default=None),
+):
+    output_format = output_format.upper()
+    if output_format not in ("WAV", "FLAC", "MP3", "OGG", "M4A"):
+        raise HTTPException(400, f"Unsupported format: {output_format}")
+
+    content = await file.read()
+    size_mb = len(content) / (1024 * 1024)
+    task_id = uuid.uuid4().hex
+    _async_tasks[task_id] = AsyncTask(
+        task_id=task_id, mode="zip",
+        input_filename=file.filename or "", input_size_mb=size_mb,
+    )
+    asyncio.create_task(_run_async_task(
+        task_id, content, file.filename or "", size_mb,
+        ensemble_preset, model_filename, output_format, single_stem, want_zip=True,
+    ))
+    return {
+        "task_id": task_id,
+        "state": "queued",
+        "status_url": f"/tasks/{task_id}",
+        "download_url": f"/tasks/{task_id}/download",
+    }
+
+
+@app.get("/tasks/{task_id}")
+async def task_status(task_id: str):
+    t = _async_tasks.get(task_id)
+    if t is None:
+        raise HTTPException(404, "task not found (expired or never existed)")
+    out: dict[str, Any] = {
+        "task_id": t.task_id,
+        "state": t.state,
+        "mode": t.mode,
+        "input_file": t.input_filename,
+        "input_size_mb": round(t.input_size_mb, 2),
+        "created_at": t.created_at,
+        "started_at": t.started_at,
+        "finished_at": t.finished_at,
+        "error": t.error,
+    }
+    if t.state == "done":
+        if t.mode == "json":
+            out["result"] = t.result_json
+        else:
+            out["result"] = {
+                "download_url": f"/tasks/{task_id}/download",
+                "size_bytes": len(t.result_zip) if t.result_zip else 0,
+            }
+    return out
+
+
+@app.get("/tasks/{task_id}/download")
+async def task_download(task_id: str):
+    t = _async_tasks.get(task_id)
+    if t is None:
+        raise HTTPException(404, "task not found (expired or never existed)")
+    if t.mode != "zip":
+        raise HTTPException(400, "task did not produce a zip; use GET /tasks/{id}")
+    if t.state == "queued" or t.state == "running":
+        raise HTTPException(409, f"task not done (state={t.state})")
+    if t.state == "failed":
+        raise HTTPException(500, f"task failed: {t.error}")
+    if not t.result_zip:
+        raise HTTPException(410, "result no longer available")
+    base_name = Path(t.input_filename).stem if t.input_filename else "result"
+    return Response(
+        content=t.result_zip,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{base_name}_separated.zip"',
         },
     )
 

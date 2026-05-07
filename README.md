@@ -42,10 +42,14 @@ python api_server.py
 | `GET` | `/queue` | 队列深度速查 |
 | `GET` | `/models` | 列出可用模型 |
 | `GET` | `/presets` | 列出集成预设 |
-| `POST` | `/separate` | 分离音频，返回 JSON 元数据 |
-| `POST` | `/separate/download` | 分离并下载 ZIP |
+| `POST` | `/separate` | 分离音频，返回 JSON 元数据（同步） |
+| `POST` | `/separate/download` | 分离并下载 ZIP（同步） |
+| `POST` | `/separate_async` | 异步提交分离任务，立即返回 task_id |
+| `POST` | `/separate/download_async` | 异步提交分离任务（产物为 ZIP） |
+| `GET` | `/tasks/{task_id}` | 查询异步任务状态/结果 |
+| `GET` | `/tasks/{task_id}/download` | 下载异步任务的 ZIP 结果 |
 
-完整接口文档见 [`docs/API.md`](docs/API.md)。
+完整接口文档（含异步轮询用例）见 [`docs/API.md`](docs/API.md)。
 
 ## 调用示例
 
