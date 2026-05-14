@@ -90,6 +90,19 @@ with open("result.zip", "wb") as f:
 | `instrumental_full` | 最大乐器保留 |
 | `karaoke` | 去除主唱人声 |
 
+调用方如果目标是“翻译配音后保留原 BGM/环境音”，推荐传
+`separation_goal=background_preserve`，服务端会映射到当前背景保留优先的
+`instrumental_full` 预设；旧的 `ensemble_preset` 调用保持兼容。
+
+## 测试
+
+单元测试可直接运行；集成测试会调用真实服务，需要显式设置 `AS_API`：
+
+```bash
+python -m pytest tests/test_api_helpers.py -q
+AS_API=http://127.0.0.1:83 python -m pytest -q
+```
+
 ## 性能
 
 4070 Ti Super 16GB + vocal_balanced 预设：

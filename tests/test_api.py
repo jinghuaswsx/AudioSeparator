@@ -1,17 +1,24 @@
-"""Tests for Audio Separator API. Requires service running at http://localhost."""
+"""Integration tests for a running Audio Separator API service."""
 
 import os
+
+import pytest
 import requests
 
-API = os.getenv("AS_API", "http://127.0.0.1")
+API = os.getenv("AS_API", "").rstrip("/")
 TIMEOUT = 120
 
+pytestmark = pytest.mark.skipif(
+    not API,
+    reason="set AS_API to a running Audio Separator service to run integration tests",
+)
 
-def _create_wav(path: str, duration: int = 2):
+
+def _create_wav(path: str, duration: int = 10):
     import numpy as np
     import soundfile as sf
     sr = 44100
-    t = np.linspace(0, duration, sr * duration)
+    t = np.linspace(0, duration, sr * duration, endpoint=False)
     sf.write(path, (0.3 * np.sin(2 * np.pi * 440 * t)).astype(np.float32), sr)
 
 

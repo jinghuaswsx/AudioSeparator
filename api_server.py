@@ -109,8 +109,12 @@ _cache: dict[str, tuple] = {}
 _cache_lock = asyncio.Lock()
 
 
-def _cache_key(content_hash: str, preset: str, fmt: str, single_stem: str) -> str:
-    return f"md5:{content_hash}:preset:{preset}:fmt:{fmt}:stem:{single_stem or ''}"
+def _cache_key(content_hash: str, preset: str, fmt: str, single_stem: str,
+               response_mode: str, model_filename: str) -> str:
+    return (
+        f"md5:{content_hash}:preset:{preset}:model:{model_filename or ''}:"
+        f"fmt:{fmt}:stem:{single_stem or ''}:mode:{response_mode}"
+    )
 
 
 async def _cache_get(key: str):
@@ -174,7 +178,8 @@ async def _async_cleanup():
 
 async def _run_async_task(task_id: str, content: bytes, filename: str, size_mb: float,
                           ensemble_preset: Optional[str], model_filename: Optional[str],
-                          output_format: str, single_stem: Optional[str], want_zip: bool):
+                          separation_goal: Optional[str], output_format: str,
+                          single_stem: Optional[str], want_zip: bool):
     global _queue_count
     t = _async_tasks.get(task_id)
     if t is None:
@@ -185,7 +190,7 @@ async def _run_async_task(task_id: str, content: bytes, filename: str, size_mb: 
         t.started_at = time.time()
         result, from_cache = await _process_or_cache(
             content, filename, size_mb,
-            ensemble_preset, model_filename, output_format, single_stem,
+            ensemble_preset, model_filename, separation_goal, output_format, single_stem,
             return_zip=want_zip,
         )
         if want_zip:
@@ -220,6 +225,42 @@ ENSEMBLE_PRESETS = {
     "instrumental_low_resource": "Fast ensemble for low VRAM (avg_fft)",
     "karaoke": "Lead vocal removal — 3-model karaoke (avg_wave)",
 }
+
+
+SEPARATION_GOALS = {
+    "vocal_quality": {
+        "preset": "vocal_balanced",
+        "description": "Default vocal quality priority",
+    },
+    "background_preserve": {
+        "preset": "instrumental_full",
+        "description": "Preserve BGM/ambience as much as possible",
+    },
+    "background_clean": {
+        "preset": "instrumental_clean",
+        "description": "Clean background with minimal vocal bleed",
+    },
+    "background_balanced": {
+        "preset": "instrumental_balanced",
+        "description": "Balanced background preservation and vocal bleed control",
+    },
+}
+
+
+def _resolve_effective_preset(
+    ensemble_preset: Optional[str],
+    model_filename: Optional[str],
+    separation_goal: Optional[str],
+) -> str:
+    if ensemble_preset:
+        return ensemble_preset.strip()
+    if model_filename:
+        return DEFAULT_ENSEMBLE_PRESET
+    goal = (separation_goal or "vocal_quality").strip() or "vocal_quality"
+    if goal not in SEPARATION_GOALS:
+        allowed = ", ".join(sorted(SEPARATION_GOALS))
+        raise HTTPException(400, f"Unsupported separation_goal: {goal} (allowed: {allowed})")
+    return SEPARATION_GOALS[goal]["preset"]
 
 
 def _get_separator(model_filename: str = None, ensemble_preset: str = None) -> Separator:
@@ -303,11 +344,13 @@ def _run_separation(input_path, ensemble_preset, model_filename, output_format, 
 
 async def _process_or_cache(content: bytes, filename: str, input_size_mb: float,
                             ensemble_preset: Optional[str], model_filename: Optional[str],
-                            output_format: str, single_stem: Optional[str],
+                            separation_goal: Optional[str], output_format: str,
+                            single_stem: Optional[str],
                             return_zip: bool = False):
     content_hash = hashlib.md5(content).hexdigest()
-    preset = ensemble_preset or DEFAULT_ENSEMBLE_PRESET
-    ck = _cache_key(content_hash, preset, output_format, single_stem or '')
+    preset = _resolve_effective_preset(ensemble_preset, model_filename, separation_goal)
+    mode = "zip" if return_zip else "json"
+    ck = _cache_key(content_hash, preset, output_format, single_stem or '', mode, model_filename or '')
 
     cached = await _cache_get(ck)
     if cached is not None:
@@ -324,8 +367,9 @@ async def _process_or_cache(content: bytes, filename: str, input_size_mb: float,
     try:
         async with _gpu_lock:
             logger.info(f"[gpu] started: {filename}")
+            run_preset = preset if ensemble_preset else (None if model_filename else preset)
             result = await asyncio.to_thread(
-                _run_separation, input_path, ensemble_preset, model_filename, output_format, single_stem
+                _run_separation, input_path, run_preset, model_filename, output_format, single_stem
             )
     finally:
         try:
@@ -427,7 +471,13 @@ async def list_models():
 
 @app.get("/presets")
 async def list_presets():
-    return {"count": len(ENSEMBLE_PRESETS), "default": DEFAULT_ENSEMBLE_PRESET, "presets": ENSEMBLE_PRESETS}
+    return {
+        "count": len(ENSEMBLE_PRESETS),
+        "default": DEFAULT_ENSEMBLE_PRESET,
+        "default_goal": "vocal_quality",
+        "goals": SEPARATION_GOALS,
+        "presets": ENSEMBLE_PRESETS,
+    }
 
 
 @app.post("/separate")
@@ -435,6 +485,7 @@ async def separate_audio(
     file: UploadFile = File(...),
     ensemble_preset: Optional[str] = Form(default=None),
     model_filename: Optional[str] = Form(default=None),
+    separation_goal: Optional[str] = Form(default=None),
     output_format: str = Form(default="WAV"),
     single_stem: Optional[str] = Form(default=None),
 ):
@@ -447,7 +498,7 @@ async def separate_audio(
 
     result, from_cache = await _process_or_cache(
         content, file.filename, input_size_mb,
-        ensemble_preset, model_filename, output_format, single_stem,
+        ensemble_preset, model_filename, separation_goal, output_format, single_stem,
         return_zip=False,
     )
 
@@ -462,6 +513,7 @@ async def separate_and_download(
     file: UploadFile = File(...),
     ensemble_preset: Optional[str] = Form(default=None),
     model_filename: Optional[str] = Form(default=None),
+    separation_goal: Optional[str] = Form(default=None),
     output_format: str = Form(default="WAV"),
     single_stem: Optional[str] = Form(default=None),
 ):
@@ -474,7 +526,7 @@ async def separate_and_download(
 
     zip_bytes, from_cache = await _process_or_cache(
         content, file.filename, input_size_mb,
-        ensemble_preset, model_filename, output_format, single_stem,
+        ensemble_preset, model_filename, separation_goal, output_format, single_stem,
         return_zip=True,
     )
 
@@ -497,6 +549,7 @@ async def separate_async(
     file: UploadFile = File(...),
     ensemble_preset: Optional[str] = Form(default=None),
     model_filename: Optional[str] = Form(default=None),
+    separation_goal: Optional[str] = Form(default=None),
     output_format: str = Form(default="WAV"),
     single_stem: Optional[str] = Form(default=None),
 ):
@@ -513,7 +566,7 @@ async def separate_async(
     )
     asyncio.create_task(_run_async_task(
         task_id, content, file.filename or "", size_mb,
-        ensemble_preset, model_filename, output_format, single_stem, want_zip=False,
+        ensemble_preset, model_filename, separation_goal, output_format, single_stem, want_zip=False,
     ))
     return {
         "task_id": task_id,
@@ -527,6 +580,7 @@ async def separate_download_async(
     file: UploadFile = File(...),
     ensemble_preset: Optional[str] = Form(default=None),
     model_filename: Optional[str] = Form(default=None),
+    separation_goal: Optional[str] = Form(default=None),
     output_format: str = Form(default="WAV"),
     single_stem: Optional[str] = Form(default=None),
 ):
@@ -543,7 +597,7 @@ async def separate_download_async(
     )
     asyncio.create_task(_run_async_task(
         task_id, content, file.filename or "", size_mb,
-        ensemble_preset, model_filename, output_format, single_stem, want_zip=True,
+        ensemble_preset, model_filename, separation_goal, output_format, single_stem, want_zip=True,
     ))
     return {
         "task_id": task_id,
